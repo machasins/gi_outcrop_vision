@@ -1,21 +1,17 @@
-import cv2
 import glob
 import time
 import json
 import gspread
 import keyboard
-import threading
 import subprocess
-import webbrowser
 import numpy as np
 import pyautogui as gui
 import simpleaudio as sa
 from os.path import isfile, abspath
-from imgurpython import ImgurClient
+from gspread.utils import rowcol_to_a1 as a1
+from gspread.utils import ValueRenderOption, ValueInputOption
 
 from fast_match import FastImageFinderParallel as fifp
-
-leyline_autofill_file_location = "../leyline_classify/run.bat"
 
 region_offset = {
     "M" : 0,
@@ -25,6 +21,7 @@ region_offset = {
     "F" : 4,
     "N" : 5,
     "K" : 6,
+    "Z" : 7,
 }
 
 region_name = {
@@ -35,44 +32,20 @@ region_name = {
     4 : "F",
     5 : "N",
     6 : "K",
+    7 : "Z",
 }
 
-url_region = 0
-outcrop_screenshot_list = {}
-leyline_screenshot_list = {}
-outcrop_finders = []
-leyline_finders = []
+url_region: int = 0
+outcrop_screenshot_list: dict[int, ] = {}
+leyline_screenshot_list: dict[int, ] = {}
+outcrop_finders: list[fifp] = []
+leyline_finders: list[fifp] = []
 
-def clamp(n, minimum, maximum):
+def clamp(n:float, minimum:float, maximum:float):
     return min(max(n, minimum), maximum)
 
-def play(filename):
+def play(filename:str):
     sa.WaveObject.from_wave_file(filename).play()
-
-def connect_to_imgur():
-    if not isfile("imgur.json"):
-        print("File \"imgur.json\" does not exist. Please create the file with your Imgur client credentials.")
-        exit(1)
-    client = None
-    data = None
-    with open("imgur.json" , 'r') as file:
-        data = json.load(file)
-        if "refresh_token" not in data.keys():
-            client = ImgurClient(data["client_id"], data["client_secret"])
-            auth_url = client.get_auth_url('pin')
-            webbrowser.open_new_tab(auth_url)
-            pin = input("Type given pin: ")
-            credentials = client.authorize(pin, 'pin')
-            client.set_user_auth(credentials['access_token'], credentials['refresh_token'])
-        else:
-            client = ImgurClient(data["client_id"], data["client_secret"], data["access_token"], data["refresh_token"])
-    # Save refresh token
-    data["access_token"] = client.auth.get_current_access_token()
-    data["refresh_token"] = client.auth.get_refresh_token()
-    with open("imgur.json", 'w') as file:
-        json.dump(data, file)
-    
-    return client
 
 def connect_to_sheets():
     if not isfile("key.json"):
@@ -80,12 +53,15 @@ def connect_to_sheets():
         exit(1)
     # Authenticate Google Sheets API
     client = gspread.service_account("key.json")
-    try:
-        ws = client.open_by_key(config["sheet_id"])
-        return ws.worksheet("DataEntry")
-    except:
-        print("The sheet ID in the config is not valid with your account.")
-        exit(1)
+    for i in range(5):
+        try:
+            ws = client.open_by_key(config["sheet_id"])
+            return ws.worksheet("DataEntry")
+        except:
+            print(f"[{ i }] There are issues with retrieving the sheet, please wait...")
+            time.sleep(5)
+    print("The sheet ID in the config is not valid with your account.")
+    exit(1)
 
 def setup_outcrop_finders():
     for n in region_offset.keys():
@@ -106,89 +82,59 @@ def switch_nation():
     play("./sounds/" + region_name[url_region] + ".wav")
 
 def calc():
-    outcrop_results = []
-    leyline_results = []
-    threads = []
+    outcrop_results: list[str] = []
+    leyline_results: list[str] = []
     for i, n in region_name.items():
-        play("./sounds/" + n + ".wav")
+        if i in outcrop_screenshot_list or i in leyline_screenshot_list:
+            play("./sounds/" + n + ".wav")
         if i in outcrop_screenshot_list:
             for s in outcrop_screenshot_list[i]:
                 outcrop_results.extend(outcrop_finders[i].find_matches(s))
         if i in leyline_screenshot_list:
             for s in leyline_screenshot_list[i]:
                 leyline_results.extend(leyline_finders[i].find_matches(s))
-        play("./shoot.wav")
-        time.sleep(0.5)
+                
+    play("./shoot.wav")
     
-    def update_outcrops(res):
-        def update_sheet(row, col):
-            done = False
-            while not done:
-                try:
-                    sheet.update_cell(row, col, 1) if not sheet.cell(row, col).value else []
-                    done = True
-                except:
-                    time.sleep(5)
+    updates: dict[tuple[int, int], (str, int)] = {}
+    
+    for f in outcrop_results:
+        name = f.removeprefix("./outcrops\\")
+        section_end = name.index("_")
+        index = int("".join(filter(str.isdigit, name[section_end + 1:name.index(".")])))
+        section = int(name[1:section_end:]) - 1
+        region = name[0]
+        row = (region_offset[region] + 1) * 3
+        col = (sum(config[region][:section])) + index
+        updates[(row, col)] = "1"
         
-        thread_pool = []
-        
-        for f in res:
-            name = f.removeprefix("./outcrops\\")
-            section_end = name.index("_")
-            index = int("".join(filter(str.isdigit, name[section_end + 1:name.index(".")])))
-            section = int(name[1:section_end:]) - 1
-            region = name[0]
-            row = (region_offset[region] + 1) * 3
-            col = (sum(config[region][:section])) + index
-            thread = threading.Thread(target=update_sheet, args=(row, col))
-            thread.start()
-            thread_pool.append(thread)
+    for f in leyline_results:
+        name = f.removeprefix("./leylines_specific\\")
+        index = int("".join(filter(str.isdigit, name[:name.index(".")])))
+        region = name[0]
+        row = (region_offset[region] + 1) * 3
+        col = config["leyline_offset"] + index
+        color = name[1]
+        updates[(row, col)] = color
     
-        for t in thread_pool:
-            t.join()
-            
-    outcrop_thread = threading.Thread(target=update_outcrops, args=(outcrop_results,))
-    outcrop_thread.start()
-    threads.append(outcrop_thread)
+    unique_rows = list(set([r for r, _ in updates.keys()]))
+    max_col = max([coord[1] for coord in updates.keys()])
     
-    play("./click.wav")
-    
-    def update_leylines(res):
-        def update_sheet(row, col, color):
-            done = False
-            while not done:
-                try:
-                    sheet.update_cell(row, col, color) if not sheet.cell(row, col).value else []
-                    done = True
-                except:
-                    time.sleep(5)
-        
-        thread_pool = []
-        
-        for f in res:
-            name = f.removeprefix("./leylines_specific\\")
-            index = int("".join(filter(str.isdigit, name[:name.index(".")])))
-            region = name[0]
-            row = (region_offset[region] + 1) * 3
-            col = config["leyline_offset"] + index
-            color = name[1]
-            thread = threading.Thread(target=update_sheet, args=(row, col, color))
-            thread.start()
-            thread_pool.append(thread)
-    
-        for t in thread_pool:
-            t.join()
-            
-    leyline_thread = threading.Thread(target=update_leylines, args=(leyline_results,))
-    leyline_thread.start()
-    threads.append(leyline_thread)
-    
-    for t in threads:
-        t.join()
+    ranges = [f"{ a1(r, 1) }:{ a1(r, max_col) }" for r in unique_rows]
+    data: list[gspread.ValueRange] = sheet.batch_get(ranges, value_render_option=ValueRenderOption.unformatted)
+    for (r, c), value in updates.items():
+        if not data[unique_rows.index(r)] or not data[unique_rows.index(r)][0]:
+            data[unique_rows.index(r)] = [[]]
+        if len(data[unique_rows.index(r)][0]) < max_col:
+            data[unique_rows.index(r)][0].extend([None]*(max_col - len(data[unique_rows.index(r)][0])))
+            data[unique_rows.index(r)][0] = [None if d == "" else d for d in data[unique_rows.index(r)][0]]
+        if data[unique_rows.index(r)][0][c - 1] is None:
+            data[unique_rows.index(r)][0][c - 1] = value
+    sheet.batch_update([{ "range" : r, "values" : data[i] } for i, r in enumerate(ranges)], value_input_option=ValueInputOption.user_entered)
     
     play("./success.wav")
     
-    subprocess.run(abspath(leyline_autofill_file_location), cwd=abspath("../leyline_classify"))
+    subprocess.run(abspath(config["leyline_autofill_file_location"]), cwd=abspath(config["leyline_autofill_file_location"] + "/.."))
             
 def find_outcrops():
     global url_region
@@ -208,7 +154,6 @@ config = read_config()
 setup_outcrop_finders()
 setup_leyline_finders()
 sheet = connect_to_sheets()
-client = connect_to_imgur()
 
 play("./sounds/M.wav")
 
@@ -216,4 +161,4 @@ keyboard.add_hotkey('num 2', calc)
 keyboard.add_hotkey('num 5', find_outcrops)
 keyboard.add_hotkey('num 4', find_leylines)
 keyboard.add_hotkey('num 6', switch_nation)
-keyboard.wait('num 1') 
+keyboard.wait('num 9') 
