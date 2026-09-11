@@ -1,0 +1,6 @@
+gspread
+keyboard
+numpy
+opencv_python
+playsound3
+pyautogui

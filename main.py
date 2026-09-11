@@ -6,8 +6,8 @@ import keyboard
 import subprocess
 import numpy as np
 import pyautogui as gui
-import simpleaudio as sa
 from os.path import isfile, abspath
+from playsound3 import playsound as ps
 from gspread.utils import rowcol_to_a1 as a1
 from gspread.utils import ValueRenderOption, ValueInputOption
 
@@ -45,7 +45,7 @@ def clamp(n:float, minimum:float, maximum:float):
     return min(max(n, minimum), maximum)
 
 def play(filename:str):
-    sa.WaveObject.from_wave_file(filename).play()
+    ps(filename, block=False)
 
 def connect_to_sheets():
     if not isfile("key.json"):
